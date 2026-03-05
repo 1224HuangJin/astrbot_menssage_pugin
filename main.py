@@ -6,7 +6,7 @@ from astrbot.api.star import Context, Star, register
 
 logger = logging.getLogger("astrbot")
 
-@register("discord_message_tool", "Developer", "支持智能解析与多维清理的 Discord 消息工具", "1.6.0")
+@register("discord_message_tool", "Developer", "支持全服/频道定向清理的 Discord 工具", "1.7.0")
 class DiscordMessageTool(Star):
     def __init__(self, context: Context):
         super().__init__(context)
@@ -15,82 +15,75 @@ class DiscordMessageTool(Star):
     async def clean(self, event: AstrMessageEvent, params: str = ""):
         """
         清理指令。
-        用法: /clean [数量] [@用户] [范围: server/channel]
-        支持自由顺序，例如: /clean params: <@1471...244> 100
+        用法: /clean params: [数量] [@用户] [server]
+        - 默认只清当前频道。加入 'server' 或 '全服' 关键字可跨频道清理指定用户的消息。
         """
-        # 1. 获取原始消息内容进行解析
-        # 即使输入了 params:，我们直接取整段参数字符串
-        input_str = params.strip() if params else ""
-        
-        # 2. 获取 Discord 底层对象
-        raw_msg = event.raw_event
-        guild = getattr(raw_msg, 'guild', None)
-        current_channel = getattr(raw_msg, 'channel', None)
-
-        if not current_channel:
-            yield event.plain_result("❌ 无法定位频道。请确保在 Discord 服务器频道内使用。")
+        # 1. 获取 Discord 原生对象 (修复 AttributeError)
+        try:
+            raw_msg = event.platform_event.raw_event 
+            if not isinstance(raw_msg, discord.Message):
+                yield event.plain_result("❌ 错误：此指令仅支持在 Discord 使用。")
+                return
+        except Exception:
+            yield event.plain_result("❌ 无法获取 Discord 事件上下文。")
             return
 
-        # 3. 权限检查 (参考 wyf9)
-        try:
-            author = getattr(raw_msg, 'author', None)
-            if author and hasattr(author, 'guild_permissions'):
-                # 必须拥有管理消息权限
-                if not (author.guild_permissions.manage_messages or author.guild_permissions.administrator):
-                    yield event.plain_result("❌ 权限不足：你没有“管理消息”权限。")
-                    return
-        except Exception:
-            pass # 无法读取权限时尝试继续，由 purge 的 Forbidden 异常处理
+        input_str = params.strip().lower()
+        guild = raw_msg.guild
+        current_channel = raw_msg.channel
 
-        # 4. 智能解析参数 (自由度核心)
-        # 提取数量: 匹配 1-3 位数字
+        # 2. 权限预检
+        if not (raw_msg.author.guild_permissions.manage_messages or raw_msg.author.guild_permissions.administrator):
+            yield event.plain_result("❌ 你没有“管理消息”权限。")
+            return
+
+        # 3. 智能解析参数
+        # 数量：匹配 1-3 位数字，默认 5
         count_match = re.search(r'\b(\d{1,3})\b', input_str)
-        count = int(count_match.group(1)) if count_match else 5 # 没写默认删 5 条
+        count = int(count_match.group(1)) if count_match else 5
 
-        # 提取用户 ID: 匹配 17-20 位长数字 (Mention 或 纯 ID)
+        # 用户 ID：匹配 17-20 位长数字
         user_id_match = re.search(r'(\d{17,20})', input_str)
-        target_user_id = user_id_match.group(1) if user_id_match else None
+        target_user_id = int(user_id_match.group(1)) if user_id_match else None
 
-        # 提取清理范围: 默认 channel，包含 server 关键字则切换
-        scope = "server" if "server" in input_str.lower() else "channel"
+        # 范围判断
+        is_server_wide = any(k in input_str for k in ["server", "全服", "all"])
 
+        # 4. 执行清理逻辑
         try:
-            # 5. 执行清理逻辑 (参考 wyf9)
-            target_channels = [current_channel]
-            if scope == "server" and guild:
-                target_channels = [ch for ch in guild.channels if isinstance(ch, discord.TextChannel)]
+            # 检查函数：如果是定向删人，判断 ID；否则全删
+            def check_func(m):
+                if target_user_id:
+                    return m.author.id == target_user_id
+                return True # 没指定人就全删
 
-            checked_messages = []
-            
-            # 逻辑：如果指定了人，扫描历史找到那个人的消息
-            if target_user_id:
-                for ch in target_channels:
-                    try:
-                        # 扫描最近的 100 条消息以寻找目标用户的消息
-                        async for msg in ch.history(limit=100):
-                            if str(msg.author.id) == target_user_id:
-                                checked_messages.append(msg)
-                                if len(checked_messages) >= count: break
-                    except: continue # 忽略无权限访问的频道
-            
-            # 执行物理删除
-            if target_user_id:
-                if not checked_messages:
-                    yield event.plain_result(f"🧹 未在指定范围内找到用户 <@{target_user_id}> 的消息。")
-                    return
+            total_deleted = 0
+
+            if is_server_wide and target_user_id:
+                # 模式 A: 全服清理特定用户 (为了安全和性能，限制每个频道扫描深度)
+                status_msg = yield event.plain_result(f"🔍 正在全服搜索并清理用户 <@{target_user_id}> 的消息...")
                 
-                # 参考 wyf9 批量删除逻辑
-                # Discord API 限制单次删除上限为 100
-                await current_channel.delete_messages(checked_messages[:count])
-                yield event.plain_result(f"🧹 已清理用户 <@{target_user_id}> 的 {len(checked_messages[:count])} 条消息。")
-            
+                for ch in guild.text_channels:
+                    try:
+                        # 跨频道清理建议 limit 不要太大，防止触发速率限制
+                        deleted = await ch.purge(limit=100, check=check_func)
+                        total_deleted += len(deleted)
+                    except discord.Forbidden:
+                        continue # 跳过没权限的频道
+                
+                yield event.plain_result(f"✅ 全服清理完成！共清理了 <@{target_user_id}> 的 {total_deleted} 条消息。")
+
             else:
-                # 普通清理模式 (所有人的消息)
-                deleted = await current_channel.purge(limit=count + 1)
-                yield event.plain_result(f"🧹 已成功清理最近的 {max(0, len(deleted)-1)} 条消息。")
+                # 模式 B: 当前频道清理
+                # 如果是清理所有人，count+1 是为了包含指令本身；如果是删特定人，通常不需要+1
+                scan_limit = count if target_user_id else count + 1
+                deleted = await current_channel.purge(limit=scan_limit, check=check_func)
+                
+                name = f"用户 <@{target_user_id}>" if target_user_id else "最近"
+                yield event.plain_result(f"🧹 已清理 {name} 的 {len(deleted)} 条消息。")
 
         except discord.Forbidden:
-            yield event.plain_result("❌ 失败：机器人缺少“管理消息”权限。")
+            yield event.plain_result("❌ 机器人权限不足，请检查“管理消息”权限。")
         except Exception as e:
-            logger.error(f"清理失败: {e}")
-            yield event.plain_result(f"❌ 清理过程发生错误: {e}")
+            logger.error(f"Clean Error: {e}")
+            yield event.plain_result(f"❌ 运行出错: {e}")
