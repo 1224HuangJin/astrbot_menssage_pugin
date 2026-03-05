@@ -6,7 +6,7 @@ from astrbot.api.star import Context, Star, register
 
 logger = logging.getLogger("astrbot")
 
-@register("discord_message_tool", "Developer", "适配 Slash Command 的消息清理工具", "2.5.0")
+@register("discord_message_tool", "Developer", "带多重降级机制的 Discord 清理工具", "3.0.0")
 class DiscordMessageTool(Star):
     def __init__(self, context: Context):
         super().__init__(context)
@@ -14,95 +14,129 @@ class DiscordMessageTool(Star):
     @filter.command("clean")
     async def clean(self, event: AstrMessageEvent, params: str = ""):
         """
-        用法: /clean params: [数量] [@用户] [server]
+        指令用法: /clean params: [数量] [@用户] [server]
         """
-        # --- 1. 获取 Discord 交互对象 ---
-        # 在 AstrBot 中，Discord 平台的底层事件通常存放在这里
-        p_event = getattr(event, 'platform_event', None)
-        # 尝试从 platform_event 中寻找 'event' 属性 (这是 discord.py 的原生 Interaction 或 Message)
-        raw_obj = getattr(p_event, 'event', None) 
+        channel = None
+        guild = None
+        author = None
         
-        # 如果还是拿不到，尝试直接获取 message_obj
-        if not raw_obj:
-            raw_obj = event.message_obj
+        # ==========================================
+        # 核心环节：多重回退机制获取 Discord 对象
+        # ==========================================
+        
+        # 策略 1: 尝试 AstrBot 官方标准路径 (最常见)
+        try:
+            raw_obj = event.message_obj.raw_message
+            if isinstance(raw_obj, (discord.Message, discord.Interaction)):
+                channel = getattr(raw_obj, 'channel', None)
+                guild = getattr(raw_obj, 'guild', None)
+                author = getattr(raw_obj, 'author', getattr(raw_obj, 'user', None))
+        except Exception:
+            raw_obj = None
 
-        if not raw_obj:
-            yield event.plain_result("❌ 错误：无法捕获 Discord 交互对象，请确认在 Discord 中使用。")
-            return
+        # 策略 2: 尝试从 platform_event 中遍历获取 (兼容旧版或特殊分支)
+        if not channel:
+            p_event = getattr(event, 'platform_event', None)
+            if p_event:
+                for attr_name in ['message', 'interaction', 'event', 'raw_event', 'raw_obj']:
+                    try:
+                        obj = getattr(p_event, attr_name, None)
+                        if isinstance(obj, (discord.Message, discord.Interaction)):
+                            channel = getattr(obj, 'channel', None)
+                            guild = getattr(obj, 'guild', None)
+                            author = getattr(obj, 'author', getattr(obj, 'user', None))
+                            break
+                    except Exception:
+                        continue
 
-        # --- 2. 核心：从 Interaction/Message 中提取环境 ---
-        # Discord 的 Interaction 对象直接包含 guild 和 channel
-        channel = getattr(raw_obj, 'channel', None)
-        guild = getattr(raw_obj, 'guild', None)
-        # 执行者：Interaction 用 user, Message 用 author
-        author = getattr(raw_obj, 'user', getattr(raw_obj, 'author', None))
+        # 策略 3: 参考 wyf9 做法，直接调用 AstrBot 底层 Client 强制拉取 (终极兜底)
+        if not channel:
+            try:
+                # 尝试获取 discord.Client 实例
+                bot_instance = getattr(event, 'bot', None)
+                client = getattr(bot_instance, 'client', getattr(bot_instance, 'bot', None))
+                
+                if isinstance(client, discord.Client):
+                    # 通过 AstrBot 统一事件获取当前频道 ID
+                    channel_id = event.message_obj.group_id or event.message_obj.session_id
+                    if channel_id:
+                        channel_id = int(channel_id)
+                        # 强行获取或拉取频道
+                        channel = client.get_channel(channel_id) or await client.fetch_channel(channel_id)
+                        if channel:
+                            guild = channel.guild
+                            # 这种情况下执行者 ID 只能从 AstrBot 基础事件拿
+                            author_id = int(event.message_obj.sender.user_id)
+                            author = guild.get_member(author_id) or await guild.fetch_member(author_id)
+            except Exception as e:
+                logger.warning(f"策略 3 失败: {e}")
 
+        # --- 校验获取结果 ---
         if not channel or not guild:
-            yield event.plain_result("❌ 无法确定位置。请确保机器人在该频道有“查看频道”权限。")
+            yield event.plain_result("❌ 终极环境错误：经过 3 轮尝试，仍无法获取 Discord 频道对象。请确认机器人有“读取消息/查看频道”权限。")
             return
 
-        # --- 3. 权限检查 (参考 wyf9) ---
+        # ==========================================
+        # 权限与参数解析环节
+        # ==========================================
+        
+        # 检查权限
         if author:
-            # 检查是否有管理消息的权限
             perms = channel.permissions_for(author) if hasattr(channel, 'permissions_for') else getattr(author, 'guild_permissions', None)
             if perms and not (perms.manage_messages or perms.administrator):
-                yield event.plain_result("❌ 你没有“管理消息”权限，无法指挥我。")
+                yield event.plain_result("❌ 你没有“管理消息”权限，无法执行清理。")
                 return
 
-        # --- 4. 智能解析单个参数 params ---
+        # 解析 params
         input_str = params.strip().lower()
         
-        # 提取数字 (1-100)
         count_match = re.search(r'\b(\d{1,3})\b', input_str)
         count = int(count_match.group(1)) if count_match else 5
-        count = min(count, 100) # Discord purge 建议单次不超过 100
+        count = min(count, 100) # 限制单次最大100条以防触发 Discord 限流
 
-        # 提取用户 ID (支持 <@123...> 或 纯数字)
         user_id_match = re.search(r'(\d{17,20})', input_str)
         target_user_id = int(user_id_match.group(1)) if user_id_match else None
 
-        # 范围判断
         is_server_wide = any(k in input_str for k in ["server", "全服", "all"])
 
-        # --- 5. 执行清理逻辑 ---
+        # ==========================================
+        # 执行清理环节 (调用原生 discord.py API)
+        # ==========================================
         try:
-            # 定义过滤规则：如果指定了人，就只删那个人的
+            # 过滤函数
             def check_func(m):
                 if target_user_id:
                     return m.author.id == target_user_id
                 return True
 
             if is_server_wide and target_user_id:
-                yield event.plain_result(f"🔍 启动全服清理：正在各频道搜寻 <@{target_user_id}> 的消息...")
-                total = 0
+                yield event.plain_result(f"🔍 正在全服扫描并清理 <@{target_user_id}> 的消息...")
+                total_deleted = 0
                 for ch in guild.text_channels:
-                    try:
-                        # 检查机器人对该频道是否有权限
-                        if ch.permissions_for(guild.me).manage_messages:
+                    # 检查机器人自身是否有权限删这个频道的图
+                    if ch.permissions_for(guild.me).manage_messages:
+                        try:
                             deleted = await ch.purge(limit=100, check=check_func)
-                            total += len(deleted)
-                    except: continue
-                yield event.plain_result(f"✅ 全服清理完成：共移除 {total} 条。")
+                            total_deleted += len(deleted)
+                        except discord.HTTPException:
+                            continue # 忽略单频道报错，继续下个频道
+                yield event.plain_result(f"✅ 全服清理完毕，共移除 {total_deleted} 条。")
             
             else:
-                # 频道清理模式
-                # 如果是普通清理，需要多算 1 条以包含用户发送的指令消息（如果是消息触发的话）
-                # 如果是 Slash Command，则不需要 +1
-                is_interaction = isinstance(raw_obj, discord.Interaction)
-                limit_val = count if (target_user_id or is_interaction) else count + 1
-                
+                # 频道定向清理
+                # 如果没有指定人，数量+1是为了把刚发出的 "/clean" 指令本身也删掉
+                limit_val = count if target_user_id else count + 1
                 deleted = await channel.purge(limit=limit_val, check=check_func)
                 
-                # 计数显示逻辑
-                display_num = len(deleted)
-                if not is_interaction and not target_user_id:
-                    display_num = max(0, display_num - 1)
+                actual_num = len(deleted)
+                if not target_user_id:
+                    actual_num = max(0, actual_num - 1)
                 
-                target_name = f"<@{target_user_id}> 的" if target_user_id else "最近"
-                yield event.plain_result(f"🧹 已清理 {target_name} {display_num} 条消息。")
+                target_str = f"<@{target_user_id}> 的" if target_user_id else "最近的"
+                yield event.plain_result(f"🧹 当前频道已清理 {target_str} {actual_num} 条消息。")
 
         except discord.Forbidden:
-            yield event.plain_result("❌ 权限不足：请确保机器人在频道中拥有“管理消息”权限。")
+            yield event.plain_result("❌ 机器人的权限不足：请在 Discord 频道设置里给机器人勾选“管理消息”权限。")
         except Exception as e:
-            logger.error(f"Discord Clean Error: {e}")
-            yield event.plain_result(f"❌ 运行出错了: {str(e)}")
+            logger.error(f"清理执行失败: {e}")
+            yield event.plain_result(f"❌ 清理时发生意外错误: {str(e)}")
